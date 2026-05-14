@@ -179,10 +179,12 @@ impl Session {
         WatchStream::new(self.source.subscribe())
     }
 
+    #[allow(missing_docs)]
     pub fn list_shells(&self) -> Vec<(Sid, WsWinsize)> {
         self.source.borrow().clone()
     }
 
+    #[allow(missing_docs)]
     pub fn init_chunk_subscription(
         &self,
         id: Sid,

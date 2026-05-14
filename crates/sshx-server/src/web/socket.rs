@@ -10,7 +10,6 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::SinkExt;
 use sshx_core::proto::{server_update::ServerMessage, NewShell, TerminalInput, TerminalSize};
-use sshx_core::Sid;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
@@ -248,30 +247,23 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 let session = Arc::clone(&session);
                 let chunks_tx = chunks_tx.clone();
                 tokio::spawn(async move {
-                    let mut next_chunknum = chunknum;
-                    loop {
-                        let Some((seqnum, chunks, current_chunks)) =
-                            session.chunks_since(id, next_chunknum)
-                        else {
-                            return;
-                        };
-                        next_chunknum = current_chunks;
-                        if !chunks.is_empty() {
-                            let msg = WsServer::Chunks(id, seqnum, chunks);
-                            let mut buf = Vec::new();
-                            if ciborium::ser::into_writer(&msg, &mut buf).is_err() {
-                                return;
-                            }
-                            if chunks_tx.send(Bytes::from(buf)).await.is_err() {
-                                return;
-                            }
-                        }
-                        break;
-                    }
-
-                    let Some(rx) = session.subscribe_encoded_chunks(id) else {
+                    let Some((rx, seqnum, chunks, baseline_chunks)) =
+                        session.init_chunk_subscription(id, chunknum)
+                    else {
                         return;
                     };
+                    let mut next_chunknum = baseline_chunks;
+                    if !chunks.is_empty() {
+                        let msg = WsServer::Chunks(id, seqnum, chunks);
+                        let mut buf = Vec::new();
+                        if ciborium::ser::into_writer(&msg, &mut buf).is_err() {
+                            return;
+                        }
+                        if chunks_tx.send(Bytes::from(buf)).await.is_err() {
+                            return;
+                        }
+                    }
+
                     let mut stream = BroadcastStream::new(rx);
                     while let Some(item) = stream.next().await {
                         match item {
@@ -282,12 +274,12 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                                 next_chunknum += 1;
                             }
                             Err(BroadcastStreamRecvError::Lagged(_)) => loop {
-                                let Some((seqnum, chunks, current_chunks)) =
-                                    session.chunks_since(id, next_chunknum)
+                                let Some((_rx, seqnum, chunks, baseline_chunks)) =
+                                    session.init_chunk_subscription(id, next_chunknum)
                                 else {
                                     return;
                                 };
-                                next_chunknum = current_chunks;
+                                next_chunknum = baseline_chunks;
                                 if chunks.is_empty() {
                                     break;
                                 }
