@@ -24,6 +24,7 @@ mod snapshot;
 
 /// Store a rolling buffer with at most this quantity of output, per shell.
 const SHELL_STORED_BYTES: u64 = 1 << 21; // 2 MiB
+const SHELL_CHUNK_BROADCAST_CAPACITY: usize = 256;
 
 /// Static metadata for this session.
 #[derive(Debug, Clone)]
@@ -80,7 +81,7 @@ pub struct Session {
 }
 
 /// Internal state for each shell.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct State {
     /// Sequence number, indicating how many bytes have been received.
     seqnum: u64,
@@ -99,6 +100,29 @@ struct State {
 
     /// Updated when any of the above fields change.
     notify: Arc<Notify>,
+
+    chunks: broadcast::Sender<Bytes>,
+}
+
+impl State {
+    fn new() -> Self {
+        let (chunks, _rx) = broadcast::channel(SHELL_CHUNK_BROADCAST_CAPACITY);
+        State {
+            seqnum: 0,
+            data: Vec::new(),
+            chunk_offset: 0,
+            byte_offset: 0,
+            closed: false,
+            notify: Arc::new(Notify::new()),
+            chunks,
+        }
+    }
+}
+
+fn encode_wsserver(msg: &WsServer) -> Result<Bytes> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(msg, &mut buf)?;
+    Ok(Bytes::from(buf))
 }
 
 impl Session {
@@ -113,7 +137,7 @@ impl Session {
             counter: IdCounter::default(),
             last_accessed: Mutex::new(now),
             source: watch::channel(Vec::new()).0,
-            broadcast: broadcast::channel(64).0,
+            broadcast: broadcast::channel(1024).0,
             update_tx,
             update_rx,
             sync_notify: Notify::new(),
@@ -153,6 +177,37 @@ impl Session {
     /// Receive a notification every time the set of shells is changed.
     pub fn subscribe_shells(&self) -> impl Stream<Item = Vec<(Sid, WsWinsize)>> + Unpin {
         WatchStream::new(self.source.subscribe())
+    }
+
+    pub fn list_shells(&self) -> Vec<(Sid, WsWinsize)> {
+        self.source.borrow().clone()
+    }
+
+    pub fn init_chunk_subscription(
+        &self,
+        id: Sid,
+        chunknum: u64,
+    ) -> Option<(broadcast::Receiver<Bytes>, u64, Vec<Bytes>, u64)> {
+        let shells = self.shells.read();
+        let shell = shells.get(&id)?;
+        if shell.closed {
+            return None;
+        }
+
+        let rx = shell.chunks.subscribe();
+        let mut seqnum = shell.byte_offset;
+        let baseline_chunks = shell.chunk_offset + shell.data.len() as u64;
+        if chunknum < baseline_chunks {
+            let start = chunknum.saturating_sub(shell.chunk_offset) as usize;
+            seqnum += shell.data[..start]
+                .iter()
+                .map(|x| x.len() as u64)
+                .sum::<u64>();
+            let chunks = shell.data[start..].to_vec();
+            Some((rx, seqnum, chunks, baseline_chunks))
+        } else {
+            Some((rx, shell.seqnum, Vec::new(), baseline_chunks))
+        }
     }
 
     /// Subscribe for chunks from a shell, until it is closed.
@@ -201,7 +256,7 @@ impl Session {
         use std::collections::hash_map::Entry::*;
         let _guard = match self.shells.write().entry(id) {
             Occupied(_) => bail!("shell already exists with id={id}"),
-            Vacant(v) => v.insert(State::default()),
+            Vacant(v) => v.insert(State::new()),
         };
         self.source.send_modify(|source| {
             let winsize = WsWinsize {
@@ -263,8 +318,9 @@ impl Session {
             let start = shell.seqnum - seq;
             let segment = data.slice(start as usize..);
             debug!(%id, bytes = segment.len(), "adding data to shell");
+            let seqnum = shell.seqnum;
             shell.seqnum += segment.len() as u64;
-            shell.data.push(segment);
+            shell.data.push(Bytes::clone(&segment));
 
             // Prune old chunks if we've exceeded the maximum stored bytes.
             let mut stored_bytes = shell.seqnum - shell.byte_offset;
@@ -278,6 +334,11 @@ impl Session {
                     offset += 1;
                 }
                 shell.data.drain(..offset);
+            }
+
+            let msg = WsServer::Chunks(id, seqnum, vec![segment]);
+            if let Ok(encoded) = encode_wsserver(&msg) {
+                shell.chunks.send(encoded).ok();
             }
 
             shell.notify.notify_waiters();
