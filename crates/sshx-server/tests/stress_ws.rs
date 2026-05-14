@@ -25,7 +25,11 @@ async fn test_ws_broadcast_lag_resync() -> Result<()> {
     s2.flush().await;
 
     for i in 0..5000 {
-        let focus = if i % 2 == 0 { Some(sshx_core::Sid(1)) } else { None };
+        let focus = if i % 2 == 0 {
+            Some(sshx_core::Sid(1))
+        } else {
+            None
+        };
         s2.send(WsClient::SetFocus(focus)).await;
     }
 
@@ -82,4 +86,3 @@ async fn stress_1000_ws_clients() -> Result<()> {
 
     Ok(())
 }
-
