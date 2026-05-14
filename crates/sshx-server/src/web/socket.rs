@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::extract::{
     ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     Path, State,
@@ -10,10 +10,11 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::SinkExt;
 use sshx_core::proto::{server_update::ServerMessage, NewShell, TerminalInput, TerminalSize};
-use sshx_core::Sid;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{error, info_span, warn, Instrument};
 
 use crate::session::Session;
@@ -79,6 +80,11 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
         Ok(())
     }
 
+    async fn send_bytes(socket: &mut WebSocket, bytes: Bytes) -> Result<()> {
+        socket.send(Message::Binary(bytes)).await?;
+        Ok(())
+    }
+
     /// Receive a message from the client over WebSocket.
     async fn recv(socket: &mut WebSocket) -> Result<Option<WsClient>> {
         Ok(loop {
@@ -134,23 +140,29 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
     send(socket, WsServer::Users(session.list_users())).await?;
 
     let mut subscribed = HashSet::new(); // prevent duplicate subscriptions
-    let (chunks_tx, mut chunks_rx) = mpsc::channel::<(Sid, u64, Vec<Bytes>)>(1);
+    let (chunks_tx, mut chunks_rx) = mpsc::channel::<Bytes>(32);
+    let mut last_cursor_update = Instant::now() - Duration::from_secs(1);
 
     let mut shells_stream = session.subscribe_shells();
     loop {
         let msg = tokio::select! {
             _ = session.terminated() => break,
             Some(result) = broadcast_stream.next() => {
-                let msg = result.context("client fell behind on broadcast stream")?;
-                send(socket, msg).await?;
+                match result {
+                    Ok(msg) => send(socket, msg).await?,
+                    Err(BroadcastStreamRecvError::Lagged(_)) => {
+                        send(socket, WsServer::Users(session.list_users())).await?;
+                        send(socket, WsServer::Shells(session.list_shells())).await?;
+                    }
+                }
                 continue;
             }
             Some(shells) = shells_stream.next() => {
                 send(socket, WsServer::Shells(shells)).await?;
                 continue;
             }
-            Some((id, seqnum, chunks)) = chunks_rx.recv() => {
-                send(socket, WsServer::Chunks(id, seqnum, chunks)).await?;
+            Some(bytes) = chunks_rx.recv() => {
+                send_bytes(socket, bytes).await?;
                 continue;
             }
             result = recv(socket) => {
@@ -169,7 +181,11 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 }
             }
             WsClient::SetCursor(cursor) => {
-                session.update_user(user_id, |user| user.cursor = cursor)?;
+                let now = Instant::now();
+                if now.duration_since(last_cursor_update) >= Duration::from_millis(33) {
+                    last_cursor_update = now;
+                    session.update_user(user_id, |user| user.cursor = cursor)?;
+                }
             }
             WsClient::SetFocus(id) => {
                 session.update_user(user_id, |user| user.focus = id)?;
@@ -231,11 +247,51 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 let session = Arc::clone(&session);
                 let chunks_tx = chunks_tx.clone();
                 tokio::spawn(async move {
-                    let stream = session.subscribe_chunks(id, chunknum);
-                    tokio::pin!(stream);
-                    while let Some((seqnum, chunks)) = stream.next().await {
-                        if chunks_tx.send((id, seqnum, chunks)).await.is_err() {
-                            break;
+                    let Some((rx, seqnum, chunks, baseline_chunks)) =
+                        session.init_chunk_subscription(id, chunknum)
+                    else {
+                        return;
+                    };
+                    let mut next_chunknum = baseline_chunks;
+                    if !chunks.is_empty() {
+                        let msg = WsServer::Chunks(id, seqnum, chunks);
+                        let mut buf = Vec::new();
+                        if ciborium::ser::into_writer(&msg, &mut buf).is_err() {
+                            return;
+                        }
+                        if chunks_tx.send(Bytes::from(buf)).await.is_err() {
+                            return;
+                        }
+                    }
+
+                    let mut stream = BroadcastStream::new(rx);
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(bytes) => {
+                                if chunks_tx.send(bytes).await.is_err() {
+                                    return;
+                                }
+                                next_chunknum += 1;
+                            }
+                            Err(BroadcastStreamRecvError::Lagged(_)) => loop {
+                                let Some((_rx, seqnum, chunks, baseline_chunks)) =
+                                    session.init_chunk_subscription(id, next_chunknum)
+                                else {
+                                    return;
+                                };
+                                next_chunknum = baseline_chunks;
+                                if chunks.is_empty() {
+                                    break;
+                                }
+                                let msg = WsServer::Chunks(id, seqnum, chunks);
+                                let mut buf = Vec::new();
+                                if ciborium::ser::into_writer(&msg, &mut buf).is_err() {
+                                    return;
+                                }
+                                if chunks_tx.send(Bytes::from(buf)).await.is_err() {
+                                    return;
+                                }
+                            },
                         }
                     }
                 });

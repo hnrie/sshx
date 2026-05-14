@@ -93,15 +93,13 @@ impl Session {
                     cols: shell.winsize_cols.try_into().context("cols overflow")?,
                 },
             ));
-            let shell = State {
-                seqnum: shell.seqnum,
-                data: shell.data,
-                chunk_offset: shell.chunk_offset,
-                byte_offset: shell.byte_offset,
-                closed: shell.closed,
-                notify: Default::default(),
-            };
-            shells.insert(Sid(sid), shell);
+            let mut state = State::new();
+            state.seqnum = shell.seqnum;
+            state.data = shell.data;
+            state.chunk_offset = shell.chunk_offset;
+            state.byte_offset = shell.byte_offset;
+            state.closed = shell.closed;
+            shells.insert(Sid(sid), state);
         }
         drop(shells);
         session.source.send_replace(winsizes);
