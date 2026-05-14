@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rustfmt:
     name: Rust format
@@ -33,9 +36,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - run: cargo build -p sshx-server --release
+
+      - run: cargo build -p sshx --release
+
       - run: cargo test
 
       - run: cargo clippy --all-targets -- -D warnings
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-rust-binaries
+          path: |
+            target/release/sshx
+            target/release/sshx-server
+          if-no-files-found: error
 
   windows_test:
     name: Client test (Windows)
@@ -50,7 +65,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - run: cargo build -p sshx --release
+
       - run: cargo test -p sshx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-sshx
+          path: target/release/sshx.exe
+          if-no-files-found: error
 
   web:
     name: Web lint, check, and build
@@ -62,6 +85,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "18"
+          cache: npm
 
       - run: npm ci
 
@@ -70,6 +94,12 @@ jobs:
       - run: npm run check
 
       - run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: build
+          if-no-files-found: error
 
   deploy:
     name: Deploy
