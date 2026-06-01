@@ -118,7 +118,7 @@ impl StorageMesh {
                     continue;
                 }
             };
-            let snapshot = match session.snapshot() {
+            let snapshot = match session.snapshot().await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     error!(?err, "failed to snapshot session {name}");

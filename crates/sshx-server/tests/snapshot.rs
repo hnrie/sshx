@@ -42,10 +42,10 @@ async fn test_basic_restore() -> Result<()> {
     assert!(s.shells.contains_key(&Sid(1)));
 
     // Replace the shell with its snapshot.
-    let data = server.state().lookup(&name).unwrap().snapshot()?;
+    let data = server.state().lookup(&name).unwrap().snapshot().await?;
     server
         .state()
-        .insert(&name, Arc::new(Session::restore(&data)?));
+        .insert(&name, Arc::new(Session::restore(&data).await?));
 
     let mut s = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
     s.send(WsClient::Subscribe(Sid(1), 0)).await;

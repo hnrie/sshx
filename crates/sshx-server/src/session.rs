@@ -1,17 +1,17 @@
 //! Core logic for sshx sessions, independent of message transport.
 
 use std::collections::HashMap;
-use std::ops::DerefMut;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use sshx_core::{
     proto::{server_update::ServerMessage, SequenceNumbers},
     IdCounter, Sid, Uid,
 };
+use std::ops::DerefMut;
 use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tokio::time::Instant;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, WatchStream};
 use tokio_stream::Stream;
@@ -156,8 +156,8 @@ impl Session {
     }
 
     /// Return the sequence numbers for current shells.
-    pub fn sequence_numbers(&self) -> SequenceNumbers {
-        let shells = self.shells.read();
+    pub async fn sequence_numbers(&self) -> SequenceNumbers {
+        let shells = self.shells.read().await;
         let mut map = HashMap::with_capacity(shells.len());
         for (key, value) in &*shells {
             if !value.closed {
@@ -175,22 +175,22 @@ impl Session {
     }
 
     /// Receive a notification every time the set of shells is changed.
-    pub fn subscribe_shells(&self) -> impl Stream<Item = Vec<(Sid, WsWinsize)>> + Unpin {
+    pub async fn subscribe_shells(&self) -> impl Stream<Item = Vec<(Sid, WsWinsize)>> + Unpin {
         WatchStream::new(self.source.subscribe())
     }
 
     #[allow(missing_docs)]
-    pub fn list_shells(&self) -> Vec<(Sid, WsWinsize)> {
+    pub async fn list_shells(&self) -> Vec<(Sid, WsWinsize)> {
         self.source.borrow().clone()
     }
 
     #[allow(missing_docs)]
-    pub fn init_chunk_subscription(
+    pub async fn init_chunk_subscription(
         &self,
         id: Sid,
         chunknum: u64,
     ) -> Option<(broadcast::Receiver<Bytes>, u64, Vec<Bytes>, u64)> {
-        let shells = self.shells.read();
+        let shells = self.shells.read().await;
         let shell = shells.get(&id)?;
         if shell.closed {
             return None;
@@ -203,7 +203,7 @@ impl Session {
             let start = chunknum.saturating_sub(shell.chunk_offset) as usize;
             seqnum += shell.data[..start]
                 .iter()
-                .map(|x| x.len() as u64)
+                .map(|x: &bytes::Bytes| x.len() as u64)
                 .sum::<u64>();
             let chunks = shell.data[start..].to_vec();
             Some((rx, seqnum, chunks, baseline_chunks))
@@ -223,7 +223,7 @@ impl Session {
                 // We absolutely cannot hold `shells` across an await point,
                 // since that would cause deadlocks.
                 let (seqnum, chunks, notified) = {
-                    let shells = self.shells.read();
+                    let shells = self.shells.read().await;
                     let shell = match shells.get(&id) {
                         Some(shell) if !shell.closed => shell,
                         _ => return,
@@ -235,7 +235,7 @@ impl Session {
                     let current_chunks = shell.chunk_offset + shell.data.len() as u64;
                     if chunknum < current_chunks {
                         let start = chunknum.saturating_sub(shell.chunk_offset) as usize;
-                        seqnum += shell.data[..start].iter().map(|x| x.len() as u64).sum::<u64>();
+                        seqnum += shell.data[..start].iter().map(|x: &bytes::Bytes| x.len() as u64).sum::<u64>();
                         chunks = shell.data[start..].to_vec();
                         chunknum = current_chunks;
                     }
@@ -254,9 +254,9 @@ impl Session {
     }
 
     /// Add a new shell to the session.
-    pub fn add_shell(&self, id: Sid, center: (i32, i32)) -> Result<()> {
+    pub async fn add_shell(&self, id: Sid, center: (i32, i32)) -> Result<()> {
         use std::collections::hash_map::Entry::*;
-        let _guard = match self.shells.write().entry(id) {
+        let _guard = match self.shells.write().await.entry(id) {
             Occupied(_) => bail!("shell already exists with id={id}"),
             Vacant(v) => v.insert(State::new()),
         };
@@ -273,8 +273,8 @@ impl Session {
     }
 
     /// Terminates an existing shell.
-    pub fn close_shell(&self, id: Sid) -> Result<()> {
-        match self.shells.write().get_mut(&id) {
+    pub async fn close_shell(&self, id: Sid) -> Result<()> {
+        match self.shells.write().await.get_mut(&id) {
             Some(shell) if !shell.closed => {
                 shell.closed = true;
                 shell.notify.notify_waiters();
@@ -289,8 +289,8 @@ impl Session {
         Ok(())
     }
 
-    fn get_shell_mut(&self, id: Sid) -> Result<impl DerefMut<Target = State> + '_> {
-        let shells = self.shells.write();
+    async fn get_shell_mut(&self, id: Sid) -> Result<impl DerefMut<Target = State> + '_> {
+        let shells = self.shells.write().await;
         match shells.get(&id) {
             Some(shell) if !shell.closed => {
                 Ok(RwLockWriteGuard::map(shells, |s| s.get_mut(&id).unwrap()))
@@ -301,8 +301,8 @@ impl Session {
     }
 
     /// Change the size of a terminal, notifying clients if necessary.
-    pub fn move_shell(&self, id: Sid, winsize: Option<WsWinsize>) -> Result<()> {
-        let _guard = self.get_shell_mut(id)?; // Ensures mutual exclusion.
+    pub async fn move_shell(&self, id: Sid, winsize: Option<WsWinsize>) -> Result<()> {
+        let _guard = self.get_shell_mut(id).await?; // Ensures mutual exclusion.
         self.source.send_modify(|source| {
             if let Some(idx) = source.iter().position(|&(sid, _)| sid == id) {
                 let (_, oldsize) = source.remove(idx);
@@ -313,8 +313,8 @@ impl Session {
     }
 
     /// Receive new data into the session.
-    pub fn add_data(&self, id: Sid, data: Bytes, seq: u64) -> Result<()> {
-        let mut shell = self.get_shell_mut(id)?;
+    pub async fn add_data(&self, id: Sid, data: Bytes, seq: u64) -> Result<()> {
+        let mut shell = self.get_shell_mut(id).await?;
 
         if seq <= shell.seqnum && seq + data.len() as u64 > shell.seqnum {
             let start = shell.seqnum - seq;
@@ -350,18 +350,19 @@ impl Session {
     }
 
     /// List all the users in the session.
-    pub fn list_users(&self) -> Vec<(Uid, WsUser)> {
+    pub async fn list_users(&self) -> Vec<(Uid, WsUser)> {
         self.users
             .read()
+            .await
             .iter()
-            .map(|(k, v)| (*k, v.clone()))
+            .map(|(k, v): (&Uid, &WsUser)| (*k, v.clone()))
             .collect()
     }
 
     /// Update a user in place by ID, applying a callback to the object.
-    pub fn update_user(&self, id: Uid, f: impl FnOnce(&mut WsUser)) -> Result<()> {
+    pub async fn update_user(&self, id: Uid, f: impl FnOnce(&mut WsUser)) -> Result<()> {
         let updated_user = {
-            let mut users = self.users.write();
+            let mut users = self.users.write().await;
             let user = users.get_mut(&id).context("user not found")?;
             f(user);
             user.clone()
@@ -373,18 +374,10 @@ impl Session {
     }
 
     /// Add a new user, and return a guard that removes the user when dropped.
-    pub fn user_scope(&self, id: Uid, can_write: bool) -> Result<impl Drop + '_> {
+    pub async fn add_user(&self, id: Uid, can_write: bool) -> Result<()> {
         use std::collections::hash_map::Entry::*;
 
-        #[must_use]
-        struct UserGuard<'a>(&'a Session, Uid);
-        impl Drop for UserGuard<'_> {
-            fn drop(&mut self) {
-                self.0.remove_user(self.1);
-            }
-        }
-
-        match self.users.write().entry(id) {
+        match self.users.write().await.entry(id) {
             Occupied(_) => bail!("user already exists with id={id}"),
             Vacant(v) => {
                 let user = WsUser {
@@ -395,22 +388,22 @@ impl Session {
                 };
                 v.insert(user.clone());
                 self.broadcast.send(WsServer::UserDiff(id, Some(user))).ok();
-                Ok(UserGuard(self, id))
+                Ok(())
             }
         }
     }
 
     /// Remove an existing user.
-    fn remove_user(&self, id: Uid) {
-        if self.users.write().remove(&id).is_none() {
+    pub async fn remove_user(&self, id: Uid) {
+        if self.users.write().await.remove(&id).is_none() {
             warn!(%id, "invariant violation: removed user that does not exist");
         }
         self.broadcast.send(WsServer::UserDiff(id, None)).ok();
     }
 
     /// Check if a user has write permission in the session.
-    pub fn check_write_permission(&self, user_id: Uid) -> Result<()> {
-        let users = self.users.read();
+    pub async fn check_write_permission(&self, user_id: Uid) -> Result<()> {
+        let users = self.users.read().await;
         let user = users.get(&user_id).context("user not found")?;
         if !user.can_write {
             bail!("No write permission");
@@ -419,10 +412,10 @@ impl Session {
     }
 
     /// Send a chat message into the room.
-    pub fn send_chat(&self, id: Uid, msg: &str) -> Result<()> {
+    pub async fn send_chat(&self, id: Uid, msg: &str) -> Result<()> {
         // Populate the message with the current name in case it's not known later.
         let name = {
-            let users = self.users.read();
+            let users = self.users.read().await;
             users.get(&id).context("user not found")?.name.clone()
         };
         self.broadcast
@@ -437,13 +430,13 @@ impl Session {
     }
 
     /// Register a backend client heartbeat, refreshing the timestamp.
-    pub fn access(&self) {
-        *self.last_accessed.lock() = Instant::now();
+    pub async fn access(&self) {
+        *self.last_accessed.lock().await = Instant::now();
     }
 
     /// Returns the timestamp of the last backend client activity.
-    pub fn last_accessed(&self) -> Instant {
-        *self.last_accessed.lock()
+    pub async fn last_accessed(&self) -> Instant {
+        *self.last_accessed.lock().await
     }
 
     /// Access the sender of the client message channel for this session.

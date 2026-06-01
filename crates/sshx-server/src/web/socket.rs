@@ -1,3 +1,4 @@
+use sshx_core::Uid;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use sshx_core::proto::{server_update::ServerMessage, NewShell, TerminalInput, Te
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::StreamExt;
 use tracing::{error, info_span, warn, Instrument};
 
 use crate::session::Session;
@@ -71,7 +72,12 @@ pub async fn get_session_ws(
 }
 
 /// Handle an incoming live WebSocket connection to a given session.
-async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<()> {
+async fn handle_socket_inner(
+    socket: &mut WebSocket,
+    session: Arc<Session>,
+    user_id: Uid,
+    _can_write: bool,
+) -> Result<()> {
     /// Send a message to the client over WebSocket.
     async fn send(socket: &mut WebSocket, msg: WsServer) -> Result<()> {
         let mut buf = Vec::new();
@@ -98,7 +104,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
     }
 
     let metadata = session.metadata();
-    let user_id = session.counter().next_uid();
+
     session.sync_now();
     send(socket, WsServer::Hello(user_id, metadata.name.clone())).await?;
 
@@ -133,17 +139,17 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
         }
     };
 
-    let _user_guard = session.user_scope(user_id, can_write)?;
+    session.add_user(user_id, can_write).await?;
 
     let update_tx = session.update_tx(); // start listening for updates before any state reads
     let mut broadcast_stream = session.subscribe_broadcast();
-    send(socket, WsServer::Users(session.list_users())).await?;
+    send(socket, WsServer::Users(session.list_users().await)).await?;
 
     let mut subscribed = HashSet::new(); // prevent duplicate subscriptions
     let (chunks_tx, mut chunks_rx) = mpsc::channel::<Bytes>(32);
     let mut last_cursor_update = Instant::now() - Duration::from_secs(1);
 
-    let mut shells_stream = session.subscribe_shells();
+    let mut shells_stream = session.subscribe_shells().await;
     loop {
         let msg = tokio::select! {
             _ = session.terminated() => break,
@@ -151,8 +157,8 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 match result {
                     Ok(msg) => send(socket, msg).await?,
                     Err(BroadcastStreamRecvError::Lagged(_)) => {
-                        send(socket, WsServer::Users(session.list_users())).await?;
-                        send(socket, WsServer::Shells(session.list_shells())).await?;
+                        send(socket, WsServer::Users(session.list_users().await)).await?;
+                        send(socket, WsServer::Shells(session.list_shells().await)).await?;
                     }
                 }
                 continue;
@@ -177,21 +183,25 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
             WsClient::Authenticate(_, _) => {}
             WsClient::SetName(name) => {
                 if !name.is_empty() {
-                    session.update_user(user_id, |user| user.name = name)?;
+                    session
+                        .update_user(user_id, |user| user.name = name)
+                        .await?;
                 }
             }
             WsClient::SetCursor(cursor) => {
                 let now = Instant::now();
                 if now.duration_since(last_cursor_update) >= Duration::from_millis(33) {
                     last_cursor_update = now;
-                    session.update_user(user_id, |user| user.cursor = cursor)?;
+                    session
+                        .update_user(user_id, |user| user.cursor = cursor)
+                        .await?;
                 }
             }
             WsClient::SetFocus(id) => {
-                session.update_user(user_id, |user| user.focus = id)?;
+                session.update_user(user_id, |user| user.focus = id).await?;
             }
             WsClient::Create(x, y) => {
-                if let Err(e) = session.check_write_permission(user_id) {
+                if let Err(e) = session.check_write_permission(user_id).await {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
@@ -203,18 +213,18 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     .await?;
             }
             WsClient::Close(id) => {
-                if let Err(e) = session.check_write_permission(user_id) {
+                if let Err(e) = session.check_write_permission(user_id).await {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
                 update_tx.send(ServerMessage::CloseShell(id.0)).await?;
             }
             WsClient::Move(id, winsize) => {
-                if let Err(e) = session.check_write_permission(user_id) {
+                if let Err(e) = session.check_write_permission(user_id).await {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
-                if let Err(err) = session.move_shell(id, winsize) {
+                if let Err(err) = session.move_shell(id, winsize).await {
                     send(socket, WsServer::Error(err.to_string())).await?;
                     continue;
                 }
@@ -228,7 +238,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 }
             }
             WsClient::Data(id, data, offset) => {
-                if let Err(e) = session.check_write_permission(user_id) {
+                if let Err(e) = session.check_write_permission(user_id).await {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
@@ -248,7 +258,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 let chunks_tx = chunks_tx.clone();
                 tokio::spawn(async move {
                     let Some((rx, seqnum, chunks, baseline_chunks)) =
-                        session.init_chunk_subscription(id, chunknum)
+                        session.init_chunk_subscription(id, chunknum).await
                     else {
                         return;
                     };
@@ -275,7 +285,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                             }
                             Err(BroadcastStreamRecvError::Lagged(_)) => loop {
                                 let Some((_rx, seqnum, chunks, baseline_chunks)) =
-                                    session.init_chunk_subscription(id, next_chunknum)
+                                    session.init_chunk_subscription(id, next_chunknum).await
                                 else {
                                     return;
                                 };
@@ -297,7 +307,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 });
             }
             WsClient::Chat(msg) => {
-                session.send_chat(user_id, &msg)?;
+                session.send_chat(user_id, &msg).await?;
             }
             WsClient::Ping(ts) => {
                 send(socket, WsServer::Pong(ts)).await?;
@@ -364,4 +374,17 @@ async fn proxy_redirect(socket: &mut WebSocket, host: &str, name: &str) -> Resul
     }
 
     Ok(())
+}
+
+async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<()> {
+    let metadata = session.metadata();
+    let user_id = session.counter().next_uid();
+    session.sync_now();
+    let can_write = match metadata.write_password_hash {
+        Some(_) => false,
+        None => true,
+    };
+    let res = handle_socket_inner(socket, session.clone(), user_id, can_write).await;
+    session.remove_user(user_id).await;
+    res
 }
