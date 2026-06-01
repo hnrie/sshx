@@ -150,7 +150,7 @@ async fn handle_streaming(
         tokio::select! {
             // Send periodic sync messages to the client.
             _ = sync_interval.tick() => {
-                let msg = ServerMessage::Sync(session.sequence_numbers());
+                let msg = ServerMessage::Sync(session.sequence_numbers().await);
                 if !send_msg(tx, msg).await {
                     return Err("failed to send sync message");
                 }
@@ -188,25 +188,25 @@ async fn handle_streaming(
 
 /// Handles a singe update from the client. Returns `true` on success.
 async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -> bool {
-    session.access();
+    session.access().await;
     match update.client_message {
         Some(ClientMessage::Hello(_)) => {
             return send_err(tx, "unexpected hello".into()).await;
         }
         Some(ClientMessage::Data(data)) => {
-            if let Err(err) = session.add_data(Sid(data.id), data.data, data.seq) {
+            if let Err(err) = session.add_data(Sid(data.id), data.data, data.seq).await {
                 return send_err(tx, format!("add data: {:?}", err)).await;
             }
         }
         Some(ClientMessage::CreatedShell(new_shell)) => {
             let id = Sid(new_shell.id);
             let center = (new_shell.x, new_shell.y);
-            if let Err(err) = session.add_shell(id, center) {
+            if let Err(err) = session.add_shell(id, center).await {
                 return send_err(tx, format!("add shell: {:?}", err)).await;
             }
         }
         Some(ClientMessage::ClosedShell(id)) => {
-            if let Err(err) = session.close_shell(Sid(id)) {
+            if let Err(err) = session.close_shell(Sid(id)).await {
                 return send_err(tx, format!("close shell: {:?}", err)).await;
             }
         }

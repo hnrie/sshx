@@ -116,7 +116,7 @@ impl ServerState {
         if let Some(mesh) = &self.mesh {
             let (owner, snapshot) = mesh.get_owner_snapshot(name).await?;
             if let Some(snapshot) = snapshot {
-                let session = Arc::new(Session::restore(&snapshot)?);
+                let session = Arc::new(Session::restore(&snapshot).await?);
                 self.insert(name, session.clone());
                 if let Some(owner) = owner {
                     mesh.notify_transfer(name, &owner).await?;
@@ -166,7 +166,7 @@ impl ServerState {
             let mut to_close = Vec::new();
             for entry in &self.store {
                 let session = entry.value();
-                if session.last_accessed().elapsed() > DISCONNECTED_SESSION_EXPIRY {
+                if session.last_accessed().await.elapsed() > DISCONNECTED_SESSION_EXPIRY {
                     to_close.push(entry.key().clone());
                 }
             }

@@ -19,7 +19,7 @@ const MAX_SNAPSHOT_SIZE: usize = 1 << 22; // 4 MiB
 
 impl Session {
     /// Snapshot the session, returning a compressed representation.
-    pub fn snapshot(&self) -> Result<Vec<u8>> {
+    pub async fn snapshot(&self) -> Result<Vec<u8>> {
         let ids = self.counter.get_current_values();
         let winsizes: BTreeMap<Sid, WsWinsize> = self.source.borrow().iter().cloned().collect();
         let message = SerializedSession {
@@ -27,6 +27,7 @@ impl Session {
             shells: self
                 .shells
                 .read()
+                .await
                 .iter()
                 .map(|(sid, shell)| {
                     // Prune off data until its total length is at most `SHELL_SNAPSHOT_BYTES`.
@@ -70,7 +71,7 @@ impl Session {
     }
 
     /// Restore the session from a previous compressed snapshot.
-    pub fn restore(data: &[u8]) -> Result<Self> {
+    pub async fn restore(data: &[u8]) -> Result<Self> {
         let data = zstd::bulk::decompress(data, MAX_SNAPSHOT_SIZE)?;
         let message = SerializedSession::decode(&*data)?;
 
@@ -81,7 +82,7 @@ impl Session {
         };
 
         let session = Self::new(metadata);
-        let mut shells = session.shells.write();
+        let mut shells = session.shells.write().await;
         let mut winsizes = Vec::new();
         for (sid, shell) in message.shells {
             winsizes.push((
